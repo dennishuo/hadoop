@@ -31,6 +31,7 @@ import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.CachingStrategyP
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.ClientOperationHeaderProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.DataTransferTraceInfoProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpBlockChecksumProto;
+import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpBlockCompositeCrcProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpCopyBlockProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpReadBlockProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpReplaceBlockProto;
@@ -110,6 +111,9 @@ public abstract class Receiver implements DataTransferProtocol {
       break;
     case BLOCK_CHECKSUM:
       opBlockChecksum(in);
+      break;
+    case BLOCK_COMPOSITE_CRC:
+      opBlockCompositeCrc(in);
       break;
     case TRANSFER_BLOCK:
       opTransferBlock(in);
@@ -285,6 +289,19 @@ public abstract class Receiver implements DataTransferProtocol {
         proto.getClass().getSimpleName());
     try {
     blockChecksum(PBHelperClient.convert(proto.getHeader().getBlock()),
+        PBHelperClient.convert(proto.getHeader().getToken()));
+    } finally {
+      if (traceScope != null) traceScope.close();
+    }
+  }
+
+  /** Receive OP_BLOCK_COMPOSITE_CRC */
+  private void opBlockCompositeCrc(DataInputStream in) throws IOException {
+    OpBlockCompositeCrcProto proto = OpBlockCompositeCrcProto.parseFrom(vintPrefixed(in));
+    TraceScope traceScope = continueTraceSpan(proto.getHeader(),
+        proto.getClass().getSimpleName());
+    try {
+    blockCompositeCrc(PBHelperClient.convert(proto.getHeader().getBlock()),
         PBHelperClient.convert(proto.getHeader().getToken()));
     } finally {
       if (traceScope != null) traceScope.close();

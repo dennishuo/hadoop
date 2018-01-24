@@ -510,6 +510,7 @@ public class HftpFileSystem extends FileSystem
     @Override
     public void startElement(String ns, String localname, String qname,
                 Attributes attrs) throws SAXException {
+      // TODO(dhuo): Add support here for CompositeCrc too.
       if (!MD5MD5CRC32FileChecksum.class.getName().equals(qname)) {
         if (RemoteException.class.getSimpleName().equals(qname)) {
           throw new SAXException(RemoteException.valueOf(attrs));

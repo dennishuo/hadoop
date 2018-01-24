@@ -199,4 +199,16 @@ public interface DataTransferProtocol {
    */
   void blockChecksum(final ExtendedBlock blk,
       final Token<BlockTokenIdentifier> blockToken) throws IOException;
+
+  /**
+   * Get a composite CRC32 for the block which does not depend on underlying
+   * granularity of per-chunk CRCs.
+   *
+   * @param blk a block.
+   * @param blockToken security token for accessing the block.
+   * @throws IOException
+   */
+  void blockCompositeCrc(final ExtendedBlock blk,
+      final Token<BlockTokenIdentifier> blockToken) throws IOException;
+
 }

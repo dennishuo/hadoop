@@ -36,6 +36,7 @@ import org.apache.hadoop.fs.permission.AclEntry;
 import org.apache.hadoop.fs.permission.AclStatus;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.fs.Options.ChecksumCombineMode;
 import org.apache.hadoop.fs.Options.ChecksumOpt;
 import org.apache.hadoop.hdfs.DFSClient;
 import org.apache.hadoop.hdfs.DFSInputStream;
@@ -124,7 +125,15 @@ public class Hdfs extends AbstractFileSystem {
   @Override
   public FileChecksum getFileChecksum(Path f) 
       throws IOException, UnresolvedLinkException {
-    return dfs.getFileChecksum(getUriPath(f), Long.MAX_VALUE);
+    ChecksumCombineMode mode = dfs.getConf().getChecksumCombineMode();
+    switch (mode) {
+      case MD5MD5CRC:
+        return dfs.getFileChecksum(getUriPath(f), Long.MAX_VALUE);
+      case COMPOSITE_CRC:
+        return dfs.getCompositeCrc(getUriPath(f), Long.MAX_VALUE);
+      default:
+        throw new IOException("Unknown ChecksumCombineMode: " + mode);
+    }
   }
 
   @Override

@@ -67,6 +67,7 @@ import org.apache.hadoop.hdfs.protocol.datatransfer.sasl.InvalidMagicNumberExcep
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.BlockOpResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.ClientReadStatusProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpBlockChecksumResponseProto;
+import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpBlockCompositeCrcResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.ReadOpChecksumInfoProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.ReleaseShortCircuitAccessResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.ShortCircuitShmResponseProto;
@@ -85,6 +86,7 @@ import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.net.unix.DomainSocket;
 import org.apache.hadoop.security.token.SecretManager.InvalidToken;
 import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.util.CrcUtil;
 import org.apache.hadoop.util.DataChecksum;
 import org.apache.hadoop.util.StopWatch;
 
@@ -1015,6 +1017,103 @@ class DataXceiver extends Receiver implements Runnable {
       out.flush();
     } catch (IOException ioe) {
       LOG.info("blockChecksum " + block + " received exception " + ioe);
+      incrDatanodeNetworkErrors();
+      throw ioe;
+    } finally {
+      IOUtils.closeStream(out);
+      IOUtils.closeStream(checksumIn);
+      IOUtils.closeStream(metadataIn);
+    }
+
+    //update metrics
+    datanode.metrics.addBlockChecksumOp(elapsed());
+  }
+
+  @Override
+  public void blockCompositeCrc(final ExtendedBlock block,
+      final Token<BlockTokenIdentifier> blockToken) throws IOException {
+    updateCurrentThreadName("Getting composite CRC for block " + block);
+    final DataOutputStream out = new DataOutputStream(
+        getOutputStream());
+    // Access doesn't actually depend on the Op; it's only used for logging.
+    checkAccess(out, true, block, blockToken,
+        Op.BLOCK_COMPOSITE_CRC, BlockTokenIdentifier.AccessMode.READ);
+    // client side now can specify a range of the block for checksum
+    long requestLength = block.getNumBytes();
+    Preconditions.checkArgument(requestLength >= 0);
+    // TODO(dhuo): Check semantics of getReplicaVisibleLength for incomplete
+    // blocks and whether for completed blocks this is defnitely going to match
+    // block data length on disk.
+    long visibleLength = datanode.data.getReplicaVisibleLength(block);
+    boolean partialBlk = requestLength < visibleLength;
+
+    final LengthInputStream metadataIn = datanode.data
+        .getMetaDataInputStream(block);
+
+    final DataInputStream checksumIn = new DataInputStream(
+        new BufferedInputStream(metadataIn, ioFileBufferSize));
+    try {
+      //read metadata file
+      final BlockMetadataHeader header = BlockMetadataHeader
+          .readHeader(checksumIn);
+      final DataChecksum checksum = header.getChecksum();
+      final int csize = checksum.getChecksumSize();
+      final int bytesPerCRC = checksum.getBytesPerChecksum();
+      final long crcPerBlock = csize <= 0 ? 0 :
+        (metadataIn.getLength() - BlockMetadataHeader.getHeaderSize()) / csize;
+
+      // TODO(dhuo): Maybe refactor into helper for consuming stream of
+      // fixed-size chunks
+      int curCrc = 0;
+
+      // Full chunks all have bytesPerCRC length.
+      long numFullChunks = visibleLength / bytesPerCRC;
+      int fullChunkMonomial = CrcUtil.getMonomial(
+          bytesPerCRC, CrcUtil.CASTAGNOLI_POLYNOMIAL);
+      LOG.info(String.format(
+          "Using chunk monomial 0x%08x for length %d", fullChunkMonomial, bytesPerCRC));
+      for (long chunkNum = 0; chunkNum < numFullChunks; ++chunkNum) {
+        int chunkCrc = checksumIn.readInt();
+        if (curCrc == 0) {
+          curCrc = chunkCrc;
+        } else {
+          // TODO(dhuo): use checksum.getChecksumType to select the polynomial.
+          curCrc = CrcUtil.composeWithMonomial(
+              curCrc, chunkCrc, fullChunkMonomial,
+              CrcUtil.CASTAGNOLI_POLYNOMIAL);
+        }
+      }
+
+      // There may or may not be a final partial chunk.
+      long partialChunkSize = visibleLength % bytesPerCRC;
+      if (partialChunkSize > 0) {
+        int chunkCrc = checksumIn.readInt();
+        curCrc = CrcUtil.compose(
+            curCrc, chunkCrc, partialChunkSize, CrcUtil.CASTAGNOLI_POLYNOMIAL);
+      }
+
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("block=" + block + ", bytesPerCRC=" + bytesPerCRC
+            + ", crcPerBlock=" + crcPerBlock + ", composite crc="
+            + String.format("0x%08x", curCrc));
+      }
+
+      //write reply
+      byte[] crcBuf = new byte[4];
+      crcBuf[0] = (byte)((curCrc >>> 24) & 0xff);
+      crcBuf[1] = (byte)((curCrc >>> 16) & 0xff);
+      crcBuf[2] = (byte)((curCrc >>> 8) & 0xff);
+      crcBuf[3] = (byte)((curCrc) & 0xff);
+      BlockOpResponseProto.newBuilder()
+        .setStatus(SUCCESS)
+        .setCompositeCrcResponse(OpBlockCompositeCrcResponseProto.newBuilder()
+          .setCrc(ByteString.copyFrom(crcBuf))
+          .setCrcType(PBHelperClient.convert(checksum.getChecksumType())))
+        .build()
+        .writeDelimitedTo(out);
+      out.flush();
+    } catch (IOException ioe) {
+      LOG.info("blockCompositeCrc " + block + " received exception " + ioe);
       incrDatanodeNetworkErrors();
       throw ioe;
     } finally {

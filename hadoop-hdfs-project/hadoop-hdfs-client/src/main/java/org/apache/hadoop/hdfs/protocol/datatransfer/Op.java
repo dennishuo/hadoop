@@ -38,6 +38,8 @@ public enum Op {
   REQUEST_SHORT_CIRCUIT_FDS((byte)87),
   RELEASE_SHORT_CIRCUIT_FDS((byte)88),
   REQUEST_SHORT_CIRCUIT_SHM((byte)89),
+  RESERVED_FOR_NEWER_VERSIONS((byte)90),
+  BLOCK_COMPOSITE_CRC((byte)91),
   CUSTOM((byte)127);
 
   /** The code for this operation. */

@@ -149,6 +149,10 @@ message OpBlockChecksumProto {
   required BaseHeaderProto header = 1;
 }
 
+message OpBlockCompositeCrcProto {
+  required BaseHeaderProto header = 1;
+}
+
 /**
  * An ID uniquely identifying a shared memory segment.
  */
@@ -282,6 +286,8 @@ message BlockOpResponseProto {
    * read.
    */
   optional uint32 shortCircuitAccessVersion = 6;
+
+  optional OpBlockCompositeCrcResponseProto compositeCrcResponse = 7;
 }
 
 /**
@@ -301,6 +307,11 @@ message OpBlockChecksumResponseProto {
   required uint64 crcPerBlock = 2;
   required bytes md5 = 3;
   optional ChecksumTypeProto crcType = 4;
+}
+
+message OpBlockCompositeCrcResponseProto {
+  required bytes crc = 1;
+  optional ChecksumTypeProto crcType = 2;
 }
 
 message OpCustomProto {

@@ -52,6 +52,7 @@ import org.apache.hadoop.fs.GlobalStorageStatistics;
 import org.apache.hadoop.fs.GlobalStorageStatistics.StorageStatisticsProvider;
 import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Options;
+import org.apache.hadoop.fs.Options.ChecksumCombineMode;
 import org.apache.hadoop.fs.StorageStatistics;
 import org.apache.hadoop.fs.XAttrSetFlag;
 import org.apache.hadoop.fs.Options.ChecksumOpt;
@@ -1551,7 +1552,15 @@ public class DistributedFileSystem extends FileSystem
     return new FileSystemLinkResolver<FileChecksum>() {
       @Override
       public FileChecksum doCall(final Path p) throws IOException {
-        return dfs.getFileChecksum(getPathName(p), Long.MAX_VALUE);
+        ChecksumCombineMode mode = dfs.getConf().getChecksumCombineMode();
+        switch (mode) {
+          case MD5MD5CRC:
+            return dfs.getFileChecksum(getPathName(p), Long.MAX_VALUE);
+          case COMPOSITE_CRC:
+            return dfs.getCompositeCrc(getPathName(p), Long.MAX_VALUE);
+          default:
+            throw new IOException("Unknown ChecksumCombineMode: " + mode);
+        }
       }
 
       @Override
@@ -1571,7 +1580,15 @@ public class DistributedFileSystem extends FileSystem
     return new FileSystemLinkResolver<FileChecksum>() {
       @Override
       public FileChecksum doCall(final Path p) throws IOException {
-        return dfs.getFileChecksum(getPathName(p), length);
+        ChecksumCombineMode mode = dfs.getConf().getChecksumCombineMode();
+        switch (mode) {
+          case MD5MD5CRC:
+            return dfs.getFileChecksum(getPathName(p), length);
+          case COMPOSITE_CRC:
+            return dfs.getCompositeCrc(getPathName(p), length);
+          default:
+            throw new IOException("Unknown ChecksumCombineMode: " + mode);
+        }
       }
 
       @Override

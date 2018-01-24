@@ -33,6 +33,7 @@ import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.ChecksumProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.ClientOperationHeaderProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.DataTransferTraceInfoProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpBlockChecksumProto;
+import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpBlockCompositeCrcProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpCopyBlockProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpReadBlockProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpReplaceBlockProto;
@@ -260,5 +261,15 @@ public class Sender implements DataTransferProtocol {
         .build();
 
     send(out, Op.BLOCK_CHECKSUM, proto);
+  }
+
+  @Override
+  public void blockCompositeCrc(final ExtendedBlock blk,
+      final Token<BlockTokenIdentifier> blockToken) throws IOException {
+    OpBlockCompositeCrcProto proto = OpBlockCompositeCrcProto.newBuilder()
+        .setHeader(DataTransferProtoUtil.buildBaseHeader(blk, blockToken))
+        .build();
+
+    send(out, Op.BLOCK_COMPOSITE_CRC, proto);
   }
 }

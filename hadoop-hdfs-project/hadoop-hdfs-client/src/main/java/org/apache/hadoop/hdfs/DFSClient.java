@@ -71,9 +71,11 @@ import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension.EncryptedKeyVersi
 import org.apache.hadoop.fs.BlockLocation;
 import org.apache.hadoop.fs.BlockStorageLocation;
 import org.apache.hadoop.fs.CacheFlag;
+import org.apache.hadoop.fs.CompositeCrcFileChecksum;
 import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FileAlreadyExistsException;
+import org.apache.hadoop.fs.FileChecksum;
 import org.apache.hadoop.fs.FileEncryptionInfo;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FsServerDefaults;
@@ -151,6 +153,7 @@ import org.apache.hadoop.hdfs.protocol.datatransfer.sasl.DataTransferSaslUtil;
 import org.apache.hadoop.hdfs.protocol.datatransfer.sasl.SaslDataTransferClient;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.BlockOpResponseProto;
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpBlockChecksumResponseProto;
+import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpBlockCompositeCrcResponseProto;
 import org.apache.hadoop.hdfs.protocolPB.PBHelperClient;
 import org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier;
 import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
@@ -177,6 +180,7 @@ import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.SecretManager.InvalidToken;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.TokenRenewer;
+import org.apache.hadoop.util.CrcUtil;
 import org.apache.hadoop.util.Daemon;
 import org.apache.hadoop.util.DataChecksum;
 import org.apache.hadoop.util.DataChecksum.Type;
@@ -1750,6 +1754,150 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   @VisibleForTesting
   public DataEncryptionKey getEncryptionKey() {
     return encryptionKey;
+  }
+
+  // TODO(dhuo): Javadoc, refactor
+  public FileChecksum getCompositeCrc(String src, long length)
+      throws IOException {
+    // TODO(dhuo): Refactor shared code with getFileChecksum.
+    checkOpen();
+    Preconditions.checkArgument(length >= 0);
+    //get block locations for the file range
+    LocatedBlocks blockLocations = callGetBlockLocations(namenode, src, 0,
+        length);
+    if (null == blockLocations) {
+      throw new FileNotFoundException("File does not exist: " + src);
+    }
+    if (blockLocations.isUnderConstruction()) {
+      throw new IOException("Fail to get checksum, since file " + src
+          + " is under construction.");
+    }
+    List<LocatedBlock> locatedblocks = blockLocations.getLocatedBlocks();
+    int cumulativeCrc = 0;
+    DataChecksum.Type crcType = DataChecksum.Type.DEFAULT;
+    boolean refetchBlocks = false;
+    int lastRetriedIndex = -1;
+
+    // get block composite crc for each block
+    long remaining = length;
+    if (src.contains(HdfsConstants.SEPARATOR_DOT_SNAPSHOT_DIR_SEPARATOR)) {
+      remaining = Math.min(length, blockLocations.getFileLength());
+    }
+    for(int i = 0; i < locatedblocks.size() && remaining > 0; i++) {
+      if (refetchBlocks) {  // refetch to get fresh tokens
+        blockLocations = callGetBlockLocations(namenode, src, 0, length);
+        if (null == blockLocations) {
+          throw new FileNotFoundException("File does not exist: " + src);
+        }
+        if (blockLocations.isUnderConstruction()) {
+          throw new IOException("Fail to get checksum, since file " + src
+              + " is under construction.");
+        }
+        locatedblocks = blockLocations.getLocatedBlocks();
+        refetchBlocks = false;
+      }
+      LocatedBlock lb = locatedblocks.get(i);
+      final ExtendedBlock block = lb.getBlock();
+      if (remaining < block.getNumBytes()) {
+        block.setNumBytes(remaining);
+      }
+      remaining -= block.getNumBytes();
+      final DatanodeInfo[] datanodes = lb.getLocations();
+
+      //try each datanode location of the block
+      final int timeout = 3000 * datanodes.length +
+          dfsClientConf.getSocketTimeout();
+      boolean done = false;
+      for(int j = 0; !done && j < datanodes.length; j++) {
+        DataOutputStream out = null;
+        DataInputStream in = null;
+
+        try {
+          //connect to a datanode
+          IOStreamPair pair = connectToDN(datanodes[j], timeout, lb);
+          out = new DataOutputStream(new BufferedOutputStream(pair.out,
+              smallBufferSize));
+          in = new DataInputStream(pair.in);
+
+          LOG.debug("write to {}: {}, block={}",
+              datanodes[j], Op.BLOCK_CHECKSUM, block);
+          // get block composite crc
+          new Sender(out).blockCompositeCrc(block, lb.getBlockToken());
+
+          final BlockOpResponseProto reply =
+              BlockOpResponseProto.parseFrom(PBHelperClient.vintPrefixed(in));
+
+          String logInfo = "for block " + block + " from datanode " +
+              datanodes[j];
+          DataTransferProtoUtil.checkBlockOpStatus(reply, logInfo);
+
+          OpBlockCompositeCrcResponseProto compositeCrcData =
+              reply.getCompositeCrcResponse();
+
+          //read block crc
+          byte[] blockCrcBytes = compositeCrcData.getCrc().toByteArray();
+          int blockCrc = ((int)blockCrcBytes[0] & 0x000000ff) << 24;
+          blockCrc |= ((int)blockCrcBytes[1] & 0x000000ff) << 16;
+          blockCrc |= ((int)blockCrcBytes[2] & 0x000000ff) << 8;
+          blockCrc |= ((int)blockCrcBytes[3] & 0x000000ff);
+
+          // Compose cumulative crc
+          // TODO(dhuo): CRC type
+          cumulativeCrc = CrcUtil.compose(
+              cumulativeCrc, blockCrc, block.getNumBytes(),
+              CrcUtil.CASTAGNOLI_POLYNOMIAL);
+
+          // read crc-type
+          final DataChecksum.Type ct;
+          if (compositeCrcData.hasCrcType()) {
+            ct = PBHelperClient.convert(compositeCrcData
+                .getCrcType());
+          } else {
+            LOG.debug("Retrieving checksum from an earlier-version DataNode: " +
+                "inferring checksum by reading first byte");
+            ct = inferChecksumTypeByReading(lb, datanodes[j]);
+          }
+
+          if (i == 0) { // first block
+            crcType = ct;
+          } else if (crcType != DataChecksum.Type.MIXED
+              && crcType != ct) {
+            // if crc types are mixed in a file
+            // TODO(dhuo): probably need to fail out on mixed types.
+            crcType = DataChecksum.Type.MIXED;
+          }
+
+          done = true;
+
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("got reply from " + datanodes[j] + ": crc=" + blockCrc
+                + ", getNumBytes(): " + block.getNumBytes() + ", cumulativeCrc=" + cumulativeCrc);
+          }
+        } catch (InvalidBlockTokenException ibte) {
+          if (i > lastRetriedIndex) {
+            LOG.debug("Got access token error in response to OP_BLOCK_CHECKSUM "
+                    + "for file {} for block {} from datanode {}. Will retry "
+                    + "the block once.",
+                src, block, datanodes[j]);
+            lastRetriedIndex = i;
+            done = true; // actually it's not done; but we'll retry
+            i--; // repeat at i-th block
+            refetchBlocks = true;
+            break;
+          }
+        } catch (IOException ie) {
+          LOG.warn("src=" + src + ", datanodes["+j+"]=" + datanodes[j], ie);
+        } finally {
+          IOUtils.closeStream(in);
+          IOUtils.closeStream(out);
+        }
+      }
+
+      if (!done) {
+        throw new IOException("Fail to get block MD5 for " + block);
+      }
+    }
+    return new CompositeCrcFileChecksum(cumulativeCrc, DataChecksum.Type.CRC32C);
   }
 
   /**
