@@ -53,6 +53,7 @@ import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.hdfs.DFSUtilClient;
 import org.apache.hadoop.hdfs.ExtendedBlockId;
 import org.apache.hadoop.hdfs.net.Peer;
+import org.apache.hadoop.hdfs.protocol.BlockChecksumOptions;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
@@ -85,6 +86,8 @@ import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.net.unix.DomainSocket;
 import org.apache.hadoop.security.token.SecretManager.InvalidToken;
 import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.util.CrcComposer;
+import org.apache.hadoop.util.CrcUtil;
 import org.apache.hadoop.util.DataChecksum;
 import org.apache.hadoop.util.StopWatch;
 
@@ -928,6 +931,25 @@ class DataXceiver extends Receiver implements Runnable {
     }
   }
 
+  private byte[] crcPartialBlock(
+      ExtendedBlock block, long requestLength, int partialLength,
+      DataChecksum checksum)
+    throws IOException {
+    byte[] buf = new byte[partialLength];
+    final InputStream blockIn = datanode.data.getBlockInputStream(block,
+        requestLength - partialLength);
+    try {
+      // Get the CRC of the partialLength.
+      IOUtils.readFully(blockIn, buf, 0, partialLength);
+    } finally {
+      IOUtils.closeStream(blockIn);
+    }
+    checksum.update(buf, 0, partialLength);
+    byte[] partialCrc = new byte[checksum.getChecksumSize()];
+    checksum.writeValue(partialCrc, 0, true);
+    return partialCrc;
+  }
+
   private MD5Hash calcPartialBlockChecksum(ExtendedBlock block,
       long requestLength, DataChecksum checksum, DataInputStream checksumIn)
       throws IOException {
@@ -945,29 +967,85 @@ class DataXceiver extends Receiver implements Runnable {
       }
       digester.update(buffer, 0, toDigest);
     }
-    
+
     int partialLength = (int) (requestLength % bytesPerCRC);
     if (partialLength > 0) {
-      byte[] buf = new byte[partialLength];
-      final InputStream blockIn = datanode.data.getBlockInputStream(block,
-          requestLength - partialLength);
-      try {
-        // Get the CRC of the partialLength.
-        IOUtils.readFully(blockIn, buf, 0, partialLength);
-      } finally {
-        IOUtils.closeStream(blockIn);
-      }
-      checksum.update(buf, 0, partialLength);
-      byte[] partialCrc = new byte[csize];
-      checksum.writeValue(partialCrc, 0, true);
+      byte[] partialCrc =
+          crcPartialBlock(block, requestLength, partialLength, checksum);
       digester.update(partialCrc);
     }
     return new MD5Hash(digester.digest());
   }
 
+  private byte[] computeMd5Crc(
+      ExtendedBlock block, boolean partialBlk, long crcPerBlock,
+      long requestLength, DataChecksum checksum, DataInputStream checksumIn)
+      throws IOException {
+    int bytesPerCRC = checksum.getBytesPerChecksum();
+    final MD5Hash md5 = partialBlk && crcPerBlock > 0 ?
+        calcPartialBlockChecksum(block, requestLength, checksum, checksumIn)
+          : MD5Hash.digest(checksumIn);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("block=" + block + ", bytesPerCRC=" + bytesPerCRC
+          + ", crcPerBlock=" + crcPerBlock + ", md5=" + md5);
+    }
+    return md5.getDigest();
+  }
+
+  private byte[] computeCompositeCrc(
+      ExtendedBlock block, boolean partialBlk, long crcPerBlock,
+      long requestLength, DataChecksum checksum, DataInputStream checksumIn,
+      long visibleLength)
+      throws IOException {
+    long checksumDataLength = Math.min(visibleLength, requestLength);
+    DataChecksum.Type crcType = checksum.getChecksumType();
+    int bytesPerCRC = checksum.getBytesPerChecksum();
+    CrcComposer crcComposer = CrcComposer.newCrcComposer(crcType, bytesPerCRC);
+
+    // Whether getting the checksum for the entire block (which itself may
+    // not be a full block size and may have a final chunk smaller than
+    // bytesPerCRC), we begin with a number of full chunks, all of size
+    // bytesPerCRC.
+    long numFullChunks = checksumDataLength / bytesPerCRC;
+    crcComposer.update(checksumIn, numFullChunks, bytesPerCRC);
+
+    // There may be a final partial chunk that is not full-sized. Unlike the
+    // MD5 case, we still consider this a "partial chunk" even if
+    // getRequestLength() == getVisibleLength(), since the CRC composition
+    // depends on the byte size of that final chunk, even if it already has a
+    // precomputed CRC stored in metadata. So there are two cases:
+    //   1. Reading only part of a block via getRequestLength(); we get the
+    //      crcPartialBlock() explicitly.
+    //   2. Reading full visible length; the partial chunk already has a CRC
+    //      stored in block metadata, so we just continue reading checksumIn.
+    int partialChunkSize = (int) (checksumDataLength % bytesPerCRC);
+    if (partialChunkSize > 0) {
+      if (partialBlk) {
+        byte[] partialChunkCrcBytes = crcPartialBlock(
+            block, requestLength, partialChunkSize, checksum);
+        crcComposer.update(
+            partialChunkCrcBytes, 0, partialChunkCrcBytes.length,
+            partialChunkSize);
+      } else {
+        int partialChunkCrc = checksumIn.readInt();
+        crcComposer.update(partialChunkCrc, partialChunkSize);
+      }
+    }
+
+    byte[] composedCrcs = crcComposer.digest();
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("block={}, getBytesPerCRC={}, crcPerBlock={}, compositeCrc={}",
+          block, bytesPerCRC, crcPerBlock,
+          CrcUtil.newMultiCrcWrapperFromByteArray(composedCrcs));
+    }
+    return composedCrcs;
+  }
+
   @Override
   public void blockChecksum(final ExtendedBlock block,
-      final Token<BlockTokenIdentifier> blockToken) throws IOException {
+      Token<BlockTokenIdentifier> blockToken,
+      BlockChecksumOptions blockChecksumOptions)
+      throws IOException {
     updateCurrentThreadName("Getting checksum for block " + block);
     final DataOutputStream out = new DataOutputStream(
         getOutputStream());
@@ -991,15 +1069,24 @@ class DataXceiver extends Receiver implements Runnable {
       final DataChecksum checksum = header.getChecksum();
       final int csize = checksum.getChecksumSize();
       final int bytesPerCRC = checksum.getBytesPerChecksum();
-      final long crcPerBlock = csize <= 0 ? 0 : 
+      final long crcPerBlock = csize <= 0 ? 0 :
         (metadataIn.getLength() - BlockMetadataHeader.getHeaderSize()) / csize;
 
-      final MD5Hash md5 = partialBlk && crcPerBlock > 0 ? 
-          calcPartialBlockChecksum(block, requestLength, checksum, checksumIn)
-            : MD5Hash.digest(checksumIn);
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("block=" + block + ", bytesPerCRC=" + bytesPerCRC
-            + ", crcPerBlock=" + crcPerBlock + ", md5=" + md5);
+      byte[] responseBytes;
+      switch (blockChecksumOptions.getBlockChecksumType()) {
+      case MD5CRC:
+        responseBytes = computeMd5Crc(
+            block, partialBlk, crcPerBlock, requestLength, checksum, checksumIn);
+        break;
+      case COMPOSITE_CRC:
+        responseBytes = computeCompositeCrc(
+            block, partialBlk, crcPerBlock, requestLength, checksum, checksumIn,
+            visibleLength);
+        break;
+      default:
+        throw new IOException(String.format(
+            "Unrecognized BlockChecksumType: %s",
+            blockChecksumOptions.getBlockChecksumType()));
       }
 
       //write reply
@@ -1008,8 +1095,10 @@ class DataXceiver extends Receiver implements Runnable {
         .setChecksumResponse(OpBlockChecksumResponseProto.newBuilder()             
           .setBytesPerCrc(bytesPerCRC)
           .setCrcPerBlock(crcPerBlock)
-          .setMd5(ByteString.copyFrom(md5.getDigest()))
-          .setCrcType(PBHelperClient.convert(checksum.getChecksumType())))
+          .setBlockChecksum(ByteString.copyFrom(responseBytes))
+          .setCrcType(PBHelperClient.convert(checksum.getChecksumType()))
+          .setBlockChecksumOptions(
+              PBHelperClient.convert(blockChecksumOptions)))
         .build()
         .writeDelimitedTo(out);
       out.flush();

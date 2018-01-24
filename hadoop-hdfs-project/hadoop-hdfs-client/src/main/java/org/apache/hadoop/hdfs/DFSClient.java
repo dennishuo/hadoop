@@ -68,9 +68,11 @@ import org.apache.hadoop.crypto.key.KeyProvider.KeyVersion;
 import org.apache.hadoop.fs.BlockLocation;
 import org.apache.hadoop.fs.BlockStorageLocation;
 import org.apache.hadoop.fs.CacheFlag;
+import org.apache.hadoop.fs.CompositeCrcFileChecksum;
 import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FileAlreadyExistsException;
+import org.apache.hadoop.fs.FileChecksum;
 import org.apache.hadoop.fs.FileEncryptionInfo;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FsServerDefaults;
@@ -82,6 +84,7 @@ import org.apache.hadoop.fs.MD5MD5CRC32CastagnoliFileChecksum;
 import org.apache.hadoop.fs.MD5MD5CRC32FileChecksum;
 import org.apache.hadoop.fs.MD5MD5CRC32GzipFileChecksum;
 import org.apache.hadoop.fs.Options;
+import org.apache.hadoop.fs.Options.ChecksumCombineMode;
 import org.apache.hadoop.fs.Options.ChecksumOpt;
 import org.apache.hadoop.fs.ParentNotDirectoryException;
 import org.apache.hadoop.fs.Path;
@@ -103,6 +106,8 @@ import org.apache.hadoop.hdfs.client.impl.DfsClientConf;
 import org.apache.hadoop.hdfs.client.impl.LeaseRenewer;
 import org.apache.hadoop.hdfs.net.Peer;
 import org.apache.hadoop.hdfs.protocol.AclException;
+import org.apache.hadoop.hdfs.protocol.BlockChecksumOptions;
+import org.apache.hadoop.hdfs.protocol.BlockChecksumType;
 import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
 import org.apache.hadoop.hdfs.protocol.CacheDirectiveEntry;
 import org.apache.hadoop.hdfs.protocol.CacheDirectiveInfo;
@@ -174,6 +179,8 @@ import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.SecretManager.InvalidToken;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.TokenRenewer;
+import org.apache.hadoop.util.CrcComposer;
+import org.apache.hadoop.util.CrcUtil;
 import org.apache.hadoop.util.Daemon;
 import org.apache.hadoop.util.DataChecksum;
 import org.apache.hadoop.util.DataChecksum.Type;
@@ -1726,18 +1733,24 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
     return encryptionKey;
   }
 
-  /**
-   * Get the checksum of the whole file of a range of the file. Note that the
-   * range always starts from the beginning of the file.
-   * @param src The file path
-   * @param length the length of the range, i.e., the range is [0, length]
-   * @return The checksum
-   * @see DistributedFileSystem#getFileChecksum(Path)
-   */
-  public MD5MD5CRC32FileChecksum getFileChecksum(String src, long length)
+  private FileChecksum getFileChecksumInternal(
+      String src, long length, ChecksumCombineMode combineMode)
       throws IOException {
     checkOpen();
     Preconditions.checkArgument(length >= 0);
+
+    BlockChecksumType blockChecksumType;
+    switch (combineMode) {
+    case MD5MD5CRC:
+      blockChecksumType = BlockChecksumType.MD5CRC;
+      break;
+    case COMPOSITE_CRC:
+      blockChecksumType = BlockChecksumType.COMPOSITE_CRC;
+      break;
+    default:
+      throw new IOException("Unknown ChecksumCombineMode: " + combineMode);
+    }
+
     //get block locations for the file range
     LocatedBlocks blockLocations = callGetBlockLocations(namenode, src, 0,
         length);
@@ -1749,7 +1762,7 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
           + " is under construction.");
     }
     List<LocatedBlock> locatedblocks = blockLocations.getLocatedBlocks();
-    final DataOutputBuffer md5out = new DataOutputBuffer();
+    final DataOutputBuffer blockChecksumBuf = new DataOutputBuffer();
     int bytesPerCRC = -1;
     DataChecksum.Type crcType = DataChecksum.Type.DEFAULT;
     long crcPerBlock = 0;
@@ -1800,7 +1813,10 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
           LOG.debug("write to {}: {}, block={}",
               datanodes[j], Op.BLOCK_CHECKSUM, block);
           // get block MD5
-          new Sender(out).blockChecksum(block, lb.getBlockToken());
+          new Sender(out).blockChecksum(
+              block,
+              lb.getBlockToken(),
+              new BlockChecksumOptions(blockChecksumType));
 
           final BlockOpResponseProto reply =
               BlockOpResponseProto.parseFrom(PBHelperClient.vintPrefixed(in));
@@ -1828,10 +1844,34 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
             crcPerBlock = cpb;
           }
 
-          //read md5
-          final MD5Hash md5 = new MD5Hash(
-              checksumData.getMd5().toByteArray());
-          md5.write(md5out);
+          Object blockChecksumForDebug = null;
+          switch (blockChecksumType) {
+          case MD5CRC:
+            //read md5
+            final MD5Hash md5 = new MD5Hash(
+                checksumData.getBlockChecksum().toByteArray());
+            md5.write(blockChecksumBuf);
+            blockChecksumForDebug = md5;
+            break;
+          case COMPOSITE_CRC:
+            BlockChecksumType returnedType = PBHelperClient.convert(
+                checksumData.getBlockChecksumOptions().getBlockChecksumType());
+            if (returnedType != BlockChecksumType.COMPOSITE_CRC) {
+              throw new IOException(String.format(
+                  "Unexpected blockChecksumType '%s', expecting COMPOSITE_CRC",
+                  returnedType));
+            }
+            byte[] crcBytes = checksumData.getBlockChecksum().toByteArray();
+            if (LOG.isDebugEnabled()) {
+              blockChecksumForDebug =
+                  CrcUtil.newSingleCrcWrapperFromByteArray(crcBytes);
+            }
+            blockChecksumBuf.write(crcBytes);
+            break;
+          default:
+            throw new IOException(
+                "Unknown blockChecksumType: " + blockChecksumType);
+          }
 
           // read crc-type
           final DataChecksum.Type ct;
@@ -1848,8 +1888,13 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
             crcType = ct;
           } else if (crcType != DataChecksum.Type.MIXED
               && crcType != ct) {
-            // if crc types are mixed in a file
-            crcType = DataChecksum.Type.MIXED;
+            if (blockChecksumType == BlockChecksumType.COMPOSITE_CRC) {
+              throw new IOException(
+                  "DataChecksum.Type.MIXED is not supported for COMPOSITE_CRC");
+            } else {
+              // if crc types are mixed in a file
+              crcType = DataChecksum.Type.MIXED;
+            }
           }
 
           done = true;
@@ -1859,7 +1904,8 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
               LOG.debug("set bytesPerCRC=" + bytesPerCRC
                   + ", crcPerBlock=" + crcPerBlock);
             }
-            LOG.debug("got reply from " + datanodes[j] + ": md5=" + md5);
+            LOG.debug("got reply from " + datanodes[j] + ": blockChecksum="
+                + blockChecksumForDebug);
           }
         } catch (InvalidBlockTokenException ibte) {
           if (i > lastRetriedIndex) {
@@ -1886,8 +1932,26 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
       }
     }
 
+    switch (blockChecksumType) {
+    case MD5CRC:
+      return makeMd5CrcResult(
+          crcType, bytesPerCRC, crcPerBlock, length, blockChecksumBuf,
+          blockLocations);
+    case COMPOSITE_CRC:
+      return makeCompositeCrcResult(
+          crcType, bytesPerCRC, crcPerBlock, length, blockChecksumBuf,
+          blockLocations);
+    default:
+      return null;
+    }
+  }
+
+  private FileChecksum makeMd5CrcResult(
+      DataChecksum.Type crcType, int bytesPerCRC, long crcPerBlock, long length,
+      DataOutputBuffer blockChecksumBuf, LocatedBlocks blockLocations) {
+    List<LocatedBlock> locatedBlocks = blockLocations.getLocatedBlocks();
     //compute file MD5
-    final MD5Hash fileMD5 = MD5Hash.digest(md5out.getData());
+    final MD5Hash fileMD5 = MD5Hash.digest(blockChecksumBuf.getData());
     switch (crcType) {
     case CRC32:
       return new MD5MD5CRC32GzipFileChecksum(bytesPerCRC,
@@ -1899,12 +1963,104 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
       // If there is no block allocated for the file,
       // return one with the magic entry that matches what previous
       // hdfs versions return.
-      if (locatedblocks.size() == 0 || length == 0) {
+      if (locatedBlocks.size() == 0 || length == 0) {
         return new MD5MD5CRC32GzipFileChecksum(0, 0, fileMD5);
       }
       // We will get here if above condition is not met.
       return null;
     }
+  }
+
+  private FileChecksum makeCompositeCrcResult(
+      DataChecksum.Type crcType, int bytesPerCRC, long crcPerBlock, long length,
+      DataOutputBuffer blockChecksumBuf, LocatedBlocks blockLocations)
+      throws IOException {
+    List<LocatedBlock> locatedBlocks = blockLocations.getLocatedBlocks();
+    long blockSizeHint = 0;
+    if (locatedBlocks.size() > 0) {
+      blockSizeHint = locatedBlocks.get(0).getBlockSize();
+    }
+    CrcComposer crcComposer =
+        CrcComposer.newCrcComposer(crcType, blockSizeHint);
+    byte[] blockChecksumBytes = blockChecksumBuf.getData();
+
+    long sumBlockLengths = 0;
+    for (int i = 0; i < locatedBlocks.size() - 1; ++i) {
+      LocatedBlock block = locatedBlocks.get(i);
+      // For everything except the last LocatedBlock, we expect getBlockSize()
+      // to accurately reflect the number of file bytes digested in the block
+      // checksum.
+      sumBlockLengths += block.getBlockSize();
+      int blockCrc = CrcUtil.readInt(blockChecksumBytes, i * 4);
+
+      crcComposer.update(blockCrc, block.getBlockSize());
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(String.format(
+            "Added blockCrc 0x%08x for block index %d of size %d",
+            blockCrc, i, block.getBlockSize()));
+      }
+    }
+
+    // NB: In some cases the located blocks have their block size adjusted
+    // explicitly based on the requested length, but not all cases;
+    // these numbers may or may not reflect actual sizes on disk.
+    long reportedLastBlockSize =
+        blockLocations.getLastLocatedBlock().getBlockSize();
+    long consumedLastBlockLength = reportedLastBlockSize;
+    if (length - sumBlockLengths < reportedLastBlockSize) {
+      LOG.warn(
+          "Last block length {} is less than reportedLastBlockSize {}",
+          length - sumBlockLengths, reportedLastBlockSize);
+      consumedLastBlockLength = length - sumBlockLengths;
+    }
+    // NB: blockChecksumBytes.length may be much longer than actual bytes
+    // written into the DataOutput.
+    int lastBlockCrc = CrcUtil.readInt(
+        blockChecksumBytes, 4 * (locatedBlocks.size() - 1));
+    crcComposer.update(lastBlockCrc, consumedLastBlockLength);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug(String.format(
+          "Added lastBlockCrc 0x%08x for block index %d of size %d",
+          lastBlockCrc, locatedBlocks.size() - 1, consumedLastBlockLength));
+    }
+
+    int compositeCrc = CrcUtil.readInt(crcComposer.digest(), 0);
+    return new CompositeCrcFileChecksum(
+        compositeCrc, crcType, bytesPerCRC);
+  }
+
+  /**
+   * Get the checksum of the whole file or a range of the file. Note that the
+   * range always starts from the beginning of the file. The file can be
+   * in replicated form, or striped mode. Depending on the
+   * dfs.checksum.combine.mode, checksums may or may not be comparable between
+   * different block layout forms.
+   * @param src The file path
+   * @param length the length of the range, i.e., the range is [0, length]
+   * @return The checksum
+   * @see DistributedFileSystem#getFileChecksum(Path)
+   */
+  public FileChecksum getFileChecksumWithCombineMode(String src, long length)
+      throws IOException {
+    ChecksumCombineMode combineMode = getConf().getChecksumCombineMode();
+    return getFileChecksumInternal(src, length, combineMode);
+  }
+
+  /**
+   * Get the checksum of the whole file or a range of the file. Note that the
+   * range always starts from the beginning of the file. The file can be
+   * in replicated form, or striped mode. It can be used to checksum and compare
+   * two replicated files, or two striped files, but not applicable for two
+   * files of different block layout forms.
+   * @param src The file path
+   * @param length the length of the range, i.e., the range is [0, length]
+   * @return The checksum
+   * @see DistributedFileSystem#getFileChecksum(Path)
+   */
+  public MD5MD5CRC32FileChecksum getFileChecksum(String src, long length)
+      throws IOException {
+    return (MD5MD5CRC32FileChecksum) getFileChecksumInternal(
+        src, length, ChecksumCombineMode.MD5MD5CRC);
   }
 
   /**
