@@ -1061,6 +1061,8 @@ class DataXceiver extends Receiver implements Runnable {
       final int bytesPerCRC = checksum.getBytesPerChecksum();
       final long crcPerBlock = csize <= 0 ? 0 :
         (metadataIn.getLength() - BlockMetadataHeader.getHeaderSize()) / csize;
+      final int crcPolynomial =
+          DataChecksum.getCrcPolynomialForType(checksum.getChecksumType());
 
       // TODO(dhuo): Maybe refactor into helper for consuming stream of
       // fixed-size chunks
@@ -1068,19 +1070,17 @@ class DataXceiver extends Receiver implements Runnable {
 
       // Full chunks all have bytesPerCRC length.
       long numFullChunks = visibleLength / bytesPerCRC;
-      int fullChunkMonomial = CrcUtil.getMonomial(
-          bytesPerCRC, CrcUtil.CASTAGNOLI_POLYNOMIAL);
+      int fullChunkMonomial = CrcUtil.getMonomial(bytesPerCRC, crcPolynomial);
       LOG.info(String.format(
-          "Using chunk monomial 0x%08x for length %d", fullChunkMonomial, bytesPerCRC));
+          "Using chunk monomial 0x%08x for length %d and CRC polynomial 0x%08x",
+          fullChunkMonomial, bytesPerCRC, crcPolynomial));
       for (long chunkNum = 0; chunkNum < numFullChunks; ++chunkNum) {
         int chunkCrc = checksumIn.readInt();
         if (curCrc == 0) {
           curCrc = chunkCrc;
         } else {
-          // TODO(dhuo): use checksum.getChecksumType to select the polynomial.
           curCrc = CrcUtil.composeWithMonomial(
-              curCrc, chunkCrc, fullChunkMonomial,
-              CrcUtil.CASTAGNOLI_POLYNOMIAL);
+              curCrc, chunkCrc, fullChunkMonomial, crcPolynomial);
         }
       }
 
@@ -1089,7 +1089,7 @@ class DataXceiver extends Receiver implements Runnable {
       if (partialChunkSize > 0) {
         int chunkCrc = checksumIn.readInt();
         curCrc = CrcUtil.compose(
-            curCrc, chunkCrc, partialChunkSize, CrcUtil.CASTAGNOLI_POLYNOMIAL);
+            curCrc, chunkCrc, partialChunkSize, crcPolynomial);
       }
 
       if (LOG.isDebugEnabled()) {

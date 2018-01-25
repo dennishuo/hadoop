@@ -1834,19 +1834,6 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
           OpBlockCompositeCrcResponseProto compositeCrcData =
               reply.getCompositeCrcResponse();
 
-          //read block crc
-          byte[] blockCrcBytes = compositeCrcData.getCrc().toByteArray();
-          int blockCrc = ((int)blockCrcBytes[0] & 0x000000ff) << 24;
-          blockCrc |= ((int)blockCrcBytes[1] & 0x000000ff) << 16;
-          blockCrc |= ((int)blockCrcBytes[2] & 0x000000ff) << 8;
-          blockCrc |= ((int)blockCrcBytes[3] & 0x000000ff);
-
-          // Compose cumulative crc
-          // TODO(dhuo): CRC type
-          cumulativeCrc = CrcUtil.compose(
-              cumulativeCrc, blockCrc, block.getNumBytes(),
-              CrcUtil.CASTAGNOLI_POLYNOMIAL);
-
           // read crc-type
           final DataChecksum.Type ct;
           if (compositeCrcData.hasCrcType()) {
@@ -1863,15 +1850,30 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
           } else if (crcType != DataChecksum.Type.MIXED
               && crcType != ct) {
             // if crc types are mixed in a file
-            // TODO(dhuo): probably need to fail out on mixed types.
-            crcType = DataChecksum.Type.MIXED;
+            throw new IOException(
+                "DataChecksum.Type.MIXED is not supported for COMPOSITE_CRC");
           }
+          int crcPolynomial = DataChecksum.getCrcPolynomialForType(crcType);
+
+          //read block crc
+          byte[] blockCrcBytes = compositeCrcData.getCrc().toByteArray();
+          int blockCrc = ((int)blockCrcBytes[0] & 0x000000ff) << 24;
+          blockCrc |= ((int)blockCrcBytes[1] & 0x000000ff) << 16;
+          blockCrc |= ((int)blockCrcBytes[2] & 0x000000ff) << 8;
+          blockCrc |= ((int)blockCrcBytes[3] & 0x000000ff);
+
+          // Compose cumulative crc
+          // TODO(dhuo): CRC type
+          cumulativeCrc = CrcUtil.compose(
+              cumulativeCrc, blockCrc, block.getNumBytes(), crcPolynomial);
 
           done = true;
 
           if (LOG.isDebugEnabled()) {
             LOG.debug("got reply from " + datanodes[j] + ": crc=" + blockCrc
-                + ", getNumBytes(): " + block.getNumBytes() + ", cumulativeCrc=" + cumulativeCrc);
+                + ", getNumBytes(): " + block.getNumBytes() + ", cumulativeCrc="
+                + cumulativeCrc + ", crcType=" + crcType + ", crcPolynomial="
+                + crcPolynomial);
           }
         } catch (InvalidBlockTokenException ibte) {
           if (i > lastRetriedIndex) {
@@ -1897,7 +1899,7 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
         throw new IOException("Fail to get block MD5 for " + block);
       }
     }
-    return new CompositeCrcFileChecksum(cumulativeCrc, DataChecksum.Type.CRC32C);
+    return new CompositeCrcFileChecksum(cumulativeCrc, crcType);
   }
 
   /**
