@@ -1834,8 +1834,16 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
             bytesPerCRC = bpc;
           }
           else if (bpc != bytesPerCRC) {
-            throw new IOException("Byte-per-checksum not matched: bpc=" + bpc
-                + " but bytesPerCRC=" + bytesPerCRC);
+            if (blockChecksumType == BlockChecksumType.COMPOSITE_CRC) {
+              LOG.warn(
+                  "Current bytesPerCRC={} doesn't match next bpc={}, but "
+                  + "continuing anyway because we're using COMPOSITE_CRC. "
+                  + "If trying to preserve CHECKSUMTYPE, only the current "
+                  + "bytesPerCRC will be preserved.", bytesPerCRC, bpc);
+            } else {
+              throw new IOException("Byte-per-checksum not matched: bpc=" + bpc
+                  + " but bytesPerCRC=" + bytesPerCRC);
+            }
           }
 
           //read crc-per-block
